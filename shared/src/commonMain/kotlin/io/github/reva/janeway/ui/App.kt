@@ -9,6 +9,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Switch
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.text.input.ImeAction
@@ -16,6 +17,8 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.material3.OutlinedButton
 import coil3.compose.AsyncImage
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import io.github.reva.janeway.acoustid.AcoustIdClient
 import io.github.reva.janeway.musicbrainz.CoverArtClient
 import androidx.compose.foundation.layout.Arrangement
@@ -65,19 +68,20 @@ import io.github.reva.janeway.musicbrainz.MusicBrainzClient
 import io.github.reva.janeway.musicbrainz.Release
 import io.github.reva.janeway.musicbrainz.TrackMatch
 
+/** [loadLicenses] returns the third-party notices; it is called off the main thread. */
 @Composable
-fun App(library: AudioLibrary, acoustIdApiKey: String?) {
+fun App(library: AudioLibrary, acoustIdApiKey: String?, loadLicenses: () -> String) {
     val viewModel = viewModel {
         AppViewModel(library, MusicBrainzClient(), CoverArtClient(), AcoustIdClient(), acoustIdApiKey)
     }
     MaterialTheme(colorScheme = if (isSystemInDarkTheme()) darkColorScheme() else lightColorScheme()) {
-        AppContent(viewModel)
+        AppContent(viewModel, loadLicenses)
     }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun AppContent(viewModel: AppViewModel) {
+private fun AppContent(viewModel: AppViewModel, loadLicenses: () -> String) {
     val state by viewModel.state.collectAsState()
     val pickFolder = rememberFolderPicker(viewModel::scan)
     val snackbar = remember { SnackbarHostState() }
@@ -92,6 +96,7 @@ private fun AppContent(viewModel: AppViewModel) {
 
     val title = when (val screen = state.screen) {
         Screen.Library -> state.folder?.displayName ?: "Janeway"
+        Screen.Licenses -> "Open source licenses"
         is Screen.Cluster -> viewModel.clusterFor(screen.key)?.album ?: "Album"
         is Screen.Match -> screen.release.title
     }
@@ -105,7 +110,10 @@ private fun AppContent(viewModel: AppViewModel) {
                     if (state.screen != Screen.Library && !saving) TextButton(onClick = viewModel::back) { Text("Back") }
                 },
                 actions = {
-                    if (state.screen == Screen.Library) TextButton(onClick = pickFolder) { Text("Folder") }
+                    if (state.screen == Screen.Library) {
+                        TextButton(onClick = viewModel::openLicenses) { Text("Licenses") }
+                        TextButton(onClick = pickFolder) { Text("Folder") }
+                    }
                 },
             )
         },
@@ -114,6 +122,7 @@ private fun AppContent(viewModel: AppViewModel) {
         Box(Modifier.fillMaxSize().padding(padding)) {
             when (val screen = state.screen) {
                 Screen.Library -> LibraryScreen(state, pickFolder, viewModel::openCluster, viewModel::setFilter)
+                Screen.Licenses -> LicensesScreen(loadLicenses)
                 is Screen.Cluster -> viewModel.clusterFor(screen.key)
                     ?.let {
                         ClusterScreen(
@@ -391,6 +400,23 @@ private fun Progress(text: String) {
     Row(verticalAlignment = Alignment.CenterVertically) {
         CircularProgressIndicator(Modifier.size(20.dp))
         Text(text, Modifier.padding(start = 12.dp))
+    }
+}
+
+@Composable
+private fun LicensesScreen(loadLicenses: () -> String) {
+    val paragraphs by produceState<List<String>?>(null) {
+        value = withContext(Dispatchers.Default) { loadLicenses().split(Regex("""\n\s*\n""")) }
+    }
+    val loaded = paragraphs
+    if (loaded == null) {
+        Centered { CircularProgressIndicator() }
+    } else {
+        LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(16.dp)) {
+            items(loaded) { paragraph ->
+                Text(paragraph, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(bottom = 12.dp))
+            }
+        }
     }
 }
 

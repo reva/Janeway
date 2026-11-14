@@ -49,6 +49,7 @@ data class UiState(
 
 sealed interface Screen {
     data object Library : Screen
+    data object Licenses : Screen
     data class Cluster(
         val key: String,
         val lookup: Lookup = Lookup.Idle,
@@ -259,6 +260,10 @@ class AppViewModel(
             }
             state.copy(screen = previous)
         }
+    }
+
+    fun openLicenses() {
+        _state.update { it.copy(screen = Screen.Licenses) }
     }
 
     fun setFilter(filter: LibraryFilter) {

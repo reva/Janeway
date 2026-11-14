@@ -73,6 +73,6 @@ The APK is written to `androidApp/build/outputs/apk/debug/androidApp-debug.apk`.
 
 Janeway is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version. See [LICENSE](LICENSE).
 
-Third-party components keep their own licenses: Chromaprint is LGPL 2.1 as a whole (MIT for its own code, plus parts of FFmpeg) and is linked statically; TagLib is LGPL 2.1 / MPL 1.1, and its Android binding is Apache 2.0.
+Third-party components keep their own licenses, among them Chromaprint (LGPL 2.1, linked statically), TagLib (LGPL 2.1) and KISS FFT (BSD 3-Clause). The full notices are in [THIRD_PARTY_NOTICES.txt](androidApp/src/main/assets/THIRD_PARTY_NOTICES.txt) and in the app under "Licenses".
 
 Janeway is an independent project. It is not affiliated with or endorsed by the MetaBrainz Foundation (MusicBrainz, Picard, Cover Art Archive) or AcoustID. It uses their public web services and follows their usage rules.

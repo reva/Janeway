@@ -49,4 +49,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           cp androidApp/build/outputs/apk/debug/androidApp-debug.apk "janeway-${GITHUB_REF_NAME}.apk"
-          gh release create "$GITHUB_REF_NAME" "janeway-${GITHUB_REF_NAME}.apk" --generate-notes
+          # A moved tag reuses its release and replaces the APK.
+          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "janeway-${GITHUB_REF_NAME}.apk" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" "janeway-${GITHUB_REF_NAME}.apk" --generate-notes
+          fi

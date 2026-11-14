@@ -12,6 +12,12 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         val library = AndroidAudioLibrary(applicationContext)
-        setContent { App(library, BuildConfig.ACOUSTID_API_KEY.ifBlank { null }) }
+        setContent {
+            App(
+                library = library,
+                acoustIdApiKey = BuildConfig.ACOUSTID_API_KEY.ifBlank { null },
+                loadLicenses = { assets.open("THIRD_PARTY_NOTICES.txt").bufferedReader().use { it.readText() } },
+            )
+        }
     }
 }
