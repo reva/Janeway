@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(./gradlew *)",
+      "Bash(scripts/emulator-test.sh *)",
+      "Bash(git push origin main)",
+      "Bash(git push origin v*)",
+      "Bash(gh run list *)",
+      "Bash(gh run view *)",
+      "Bash(gh run watch *)",
+      "Bash(gh release view *)"
+    ]
+  }
+}
