@@ -9,29 +9,50 @@ data class AlbumCluster(
     val files: List<AudioFile>,
 )
 
+const val VARIOUS_ARTISTS = "Various Artists"
+
 /**
- * Groups files into probable albums: by album artist and album tag when present,
- * otherwise by folder. Placeholders such as "Unknown Artist" count as missing.
+ * Groups files into probable albums by album tag and album artist. Without an album artist,
+ * files of one album stay together when they share a track artist; with several track artists
+ * (a compilation) they are grouped per folder instead. Files without an album tag are grouped
+ * by folder. Placeholders such as "Unknown Artist" count as missing.
  */
 fun clusterByAlbum(files: List<AudioFile>): List<AlbumCluster> =
-    files.groupBy { file ->
-        val album = file.knownAlbum?.normalized()
-        if (album != null) "tag:${file.knownArtist?.normalized().orEmpty()}|$album"
-        else "folder:${file.folder}"
-    }.map { (key, group) ->
-        val sorted = group.sortedWith(compareBy({ it.discNumber ?: 1 }, { it.trackNumber ?: Int.MAX_VALUE }, { it.fileName }))
-        AlbumCluster(
-            key = key,
-            album = sorted.mostCommon { it.knownAlbum } ?: sorted.first().folder.substringAfterLast('/'),
-            artist = sorted.mostCommon { it.knownArtist },
-            files = sorted,
-        )
-    }.sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { "${it.artist.orEmpty()} ${it.album.orEmpty()}" })
+    files.groupBy { it.knownAlbum?.normalized() }.flatMap { (album, sameAlbum) ->
+        if (album == null) {
+            sameAlbum.groupBy { it.folder }.map { (folder, group) -> "folder:$folder" to group }
+        } else {
+            sameAlbum.groupBy { it.knownAlbumArtist?.normalized() }.flatMap { (albumArtist, group) ->
+                val trackArtists = group.trackArtists()
+                when {
+                    albumArtist != null -> listOf("tag:$albumArtist|$album" to group)
+                    trackArtists.size <= 1 -> listOf("tag:${trackArtists.firstOrNull().orEmpty()}|$album" to group)
+                    else -> group.groupBy { it.folder }.map { (folder, inFolder) -> "tag:folder=$folder|$album" to inFolder }
+                }
+            }
+        }
+    }.map { (key, group) -> toCluster(key, group) }
+        .sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { "${it.artist.orEmpty()} ${it.album.orEmpty()}" })
+
+private fun toCluster(key: String, group: List<AudioFile>): AlbumCluster {
+    val sorted = group.sortedWith(compareBy({ it.discNumber ?: 1 }, { it.trackNumber ?: Int.MAX_VALUE }, { it.fileName }))
+    val artist = sorted.mostCommon { it.knownAlbumArtist }
+        ?: if (sorted.trackArtists().size > 1) VARIOUS_ARTISTS else sorted.mostCommon { it.knownTrackArtist }
+    return AlbumCluster(
+        key = key,
+        album = sorted.mostCommon { it.knownAlbum } ?: sorted.first().folder.substringAfterLast('/'),
+        artist = artist,
+        files = sorted,
+    )
+}
 
 private val AudioFile.knownAlbum: String? get() = album?.takeUnless { isPlaceholder(it, ALBUM_PLACEHOLDERS) }
 
-private val AudioFile.knownArtist: String?
-    get() = listOf(albumArtist, artist).firstOrNull { !isPlaceholder(it, ARTIST_PLACEHOLDERS) }
+private val AudioFile.knownAlbumArtist: String? get() = albumArtist?.takeUnless { isPlaceholder(it, ARTIST_PLACEHOLDERS) }
+
+private val AudioFile.knownTrackArtist: String? get() = artist?.takeUnless { isPlaceholder(it, ARTIST_PLACEHOLDERS) }
+
+private fun List<AudioFile>.trackArtists(): Set<String> = mapNotNullTo(mutableSetOf()) { it.knownTrackArtist?.normalized() }
 
 private fun String.normalized(): String? = trim().lowercase().takeIf { it.isNotEmpty() }
 

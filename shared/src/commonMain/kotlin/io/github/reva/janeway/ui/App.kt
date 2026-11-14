@@ -59,7 +59,6 @@ import io.github.reva.janeway.library.AlbumCluster
 import io.github.reva.janeway.library.AudioLibrary
 import io.github.reva.janeway.library.LibraryFilter
 import io.github.reva.janeway.library.TagIssue
-import io.github.reva.janeway.library.issueCounts
 import io.github.reva.janeway.library.issues
 import io.github.reva.janeway.library.matches
 import io.github.reva.janeway.musicbrainz.MusicBrainzClient
@@ -102,7 +101,8 @@ private fun AppContent(viewModel: AppViewModel) {
             TopAppBar(
                 title = { Text(title, maxLines = 1, overflow = TextOverflow.Ellipsis) },
                 navigationIcon = {
-                    if (state.screen != Screen.Library) TextButton(onClick = viewModel::back) { Text("Back") }
+                    val saving = (state.screen as? Screen.Match)?.saving == true
+                    if (state.screen != Screen.Library && !saving) TextButton(onClick = viewModel::back) { Text("Back") }
                 },
                 actions = {
                     if (state.screen == Screen.Library) TextButton(onClick = pickFolder) { Text("Folder") }
@@ -153,8 +153,8 @@ private fun LibraryScreen(
         }
         state.clusters.isEmpty() -> Centered { Text("No audio files found in this folder.") }
         else -> {
-            val issuesByAlbum = remember(state.clusters) { state.clusters.associate { it.key to it.issueCounts() } }
-            val visible = state.clusters.filter { state.filter.matches(issuesByAlbum.getValue(it.key)) }
+            val issuesByAlbum = state.issuesByAlbum
+            val visible = state.clusters.filter { state.filter.matches(issuesByAlbum[it.key].orEmpty()) }
             LazyColumn(Modifier.fillMaxSize()) {
                 item {
                     Text(
@@ -168,7 +168,7 @@ private fun LibraryScreen(
                     item { Text("No albums match this filter.", Modifier.padding(16.dp)) }
                 }
                 items(visible, key = { it.key }) { cluster ->
-                    val issues = issuesByAlbum.getValue(cluster.key)
+                    val issues = issuesByAlbum[cluster.key].orEmpty()
                     ListItem(
                         headlineContent = { Text(cluster.album ?: "Unknown album") },
                         supportingContent = {

@@ -15,8 +15,14 @@ object AudioFingerprinter {
     private const val MAX_SECONDS = 120
     private const val TIMEOUT_US = 10_000L
 
-    /** Returns null if the file has no audio track or Android has no decoder for it. Blocking. */
-    fun fingerprint(context: Context, uri: Uri): String? {
+    /** Gives up when the decoder produces no output for this many polls (about 10 seconds). */
+    private const val MAX_IDLE_POLLS = 500
+
+    /**
+     * Returns null if the file has no audio track, Android has no decoder for it, the decoder
+     * stalls, or [isActive] turns false. Blocking; [isActive] is checked between buffers.
+     */
+    fun fingerprint(context: Context, uri: Uri, isActive: () -> Boolean = { true }): String? {
         val extractor = MediaExtractor()
         try {
             extractor.setDataSource(context, uri, null)
@@ -29,7 +35,7 @@ object AudioFingerprinter {
             try {
                 codec.configure(format, null, null, 0)
                 codec.start()
-                return decode(extractor, codec)
+                return decode(extractor, codec, isActive)
             } finally {
                 codec.release()
             }
@@ -40,13 +46,14 @@ object AudioFingerprinter {
         }
     }
 
-    private fun decode(extractor: MediaExtractor, codec: MediaCodec): String? {
+    private fun decode(extractor: MediaExtractor, codec: MediaCodec, isActive: () -> Boolean): String? {
         val handle = Chromaprint.nativeNew()
         try {
             val info = MediaCodec.BufferInfo()
             var inputDone = false
             var started = false
             var samplesLeft = 0L
+            var idlePolls = 0
 
             fun start(format: MediaFormat): Boolean {
                 val encoding = if (format.containsKey(MediaFormat.KEY_PCM_ENCODING)) {
@@ -63,6 +70,7 @@ object AudioFingerprinter {
             }
 
             while (true) {
+                if (!isActive() || idlePolls++ > MAX_IDLE_POLLS) return null
                 if (!inputDone) {
                     val index = codec.dequeueInputBuffer(TIMEOUT_US)
                     if (index >= 0) {
@@ -79,8 +87,10 @@ object AudioFingerprinter {
 
                 val index = codec.dequeueOutputBuffer(info, TIMEOUT_US)
                 if (index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                    idlePolls = 0
                     if (!started && !start(codec.outputFormat)) return null
                 } else if (index >= 0) {
+                    idlePolls = 0
                     if (info.size > 0) {
                         if (!started && !start(codec.outputFormat)) return null
                         val bytes = minOf(info.size.toLong(), samplesLeft * 2).toInt()

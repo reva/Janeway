@@ -8,7 +8,9 @@ import io.github.reva.janeway.acoustid.Identification
 import io.github.reva.janeway.library.AlbumCluster
 import io.github.reva.janeway.library.AudioLibrary
 import io.github.reva.janeway.library.LibraryFilter
+import io.github.reva.janeway.library.TagIssue
 import io.github.reva.janeway.library.clusterByAlbum
+import io.github.reva.janeway.library.issueCounts
 import io.github.reva.janeway.model.AudioFile
 import io.github.reva.janeway.model.FolderRef
 import io.github.reva.janeway.musicbrainz.CoverArtClient
@@ -17,17 +19,19 @@ import io.github.reva.janeway.musicbrainz.Release
 import io.github.reva.janeway.musicbrainz.TrackMatch
 import io.github.reva.janeway.musicbrainz.countReleaseVotes
 import io.github.reva.janeway.musicbrainz.matchFilesToRelease
-import io.github.reva.janeway.musicbrainz.rankByAudioVotes
 import io.github.reva.janeway.musicbrainz.parseReleaseId
+import io.github.reva.janeway.musicbrainz.rankByAudioVotes
 import io.github.reva.janeway.musicbrainz.rankReleases
 import io.github.reva.janeway.musicbrainz.tagsFor
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 data class UiState(
     val folder: FolderRef? = null,
@@ -36,6 +40,8 @@ data class UiState(
     val scanTotal: Int = 0,
     val files: List<AudioFile> = emptyList(),
     val clusters: List<AlbumCluster> = emptyList(),
+    /** Issue counts per album key, computed together with [clusters]. */
+    val issuesByAlbum: Map<String, Map<TagIssue, Int>> = emptyMap(),
     val filter: LibraryFilter = LibraryFilter.All,
     val screen: Screen = Screen.Library,
     val message: String? = null,
@@ -50,7 +56,8 @@ sealed interface Screen {
         val recordingsByFile: Map<String, Set<String>> = emptyMap(),
     ) : Screen
     data class Match(
-        val clusterKey: String,
+        /** The album screen to return to, with its search results and fingerprints. */
+        val from: Cluster,
         val release: Release,
         val matches: List<TrackMatch>,
         val embedCover: Boolean = release.coverArt?.front == true,
@@ -80,7 +87,10 @@ class AppViewModel(
     /** Built into the app at build time; null when the build had none. */
     private val acoustIdApiKey: String?,
 ) : ViewModel() {
-    private var identifyJob: Job? = null
+    private var scanJob: Job? = null
+
+    /** The running search, fingerprinting or release load of the open album. */
+    private var lookupJob: Job? = null
 
     private val _state = MutableStateFlow(UiState())
     val state: StateFlow<UiState> = _state.asStateFlow()
@@ -90,13 +100,17 @@ class AppViewModel(
     }
 
     fun scan(folder: FolderRef) {
+        scanJob?.cancel()
         _state.update { it.copy(folder = folder, scanning = true, scannedCount = 0, scanTotal = 0, screen = Screen.Library) }
-        viewModelScope.launch {
+        scanJob = viewModelScope.launch {
+            val job = coroutineContext[Job]
             try {
                 val files = library.scan(folder) { done, total ->
-                    _state.update { it.copy(scannedCount = done, scanTotal = total) }
+                    // Reads still finishing after a newer scan started must not move its progress.
+                    if (job?.isActive == true) _state.update { it.copy(scannedCount = done, scanTotal = total) }
                 }
-                _state.update { it.copy(files = files, clusters = clusterByAlbum(files), scanning = false) }
+                val organized = organize(files)
+                _state.update { it.withLibrary(files, organized).copy(scanning = false) }
             } catch (e: Exception) {
                 if (e is CancellationException) throw e
                 _state.update { it.copy(scanning = false, message = "Scan failed: ${e.message}") }
@@ -105,6 +119,7 @@ class AppViewModel(
     }
 
     fun openCluster(cluster: AlbumCluster) {
+        lookupJob?.cancel()
         _state.update { it.copy(screen = Screen.Cluster(cluster.key)) }
     }
 
@@ -112,13 +127,11 @@ class AppViewModel(
     fun lookup(album: String, artist: String) {
         val screen = _state.value.screen as? Screen.Cluster ?: return
         val cluster = clusterFor(screen.key) ?: return
-        identifyJob?.cancel()
-        updateScreen(screen.copy(lookup = Lookup.Searching))
-        viewModelScope.launch {
+        startLookup(screen.copy(lookup = Lookup.Searching)) {
             val releaseId = parseReleaseId(album)
             if (releaseId != null) {
                 openRelease(cluster, releaseId, restore = Lookup.Idle)
-                return@launch
+                return@startLookup
             }
             val lookup = try {
                 Lookup.Results(rankReleases(musicBrainz.searchReleases(album, artist), cluster.files.size))
@@ -126,7 +139,7 @@ class AppViewModel(
                 if (e is CancellationException) throw e
                 Lookup.Failed(e.message ?: e::class.simpleName.orEmpty())
             }
-            updateScreenIf<Screen.Cluster> { it.copy(lookup = lookup) }
+            updateCluster(cluster.key) { it.copy(lookup = lookup) }
         }
     }
 
@@ -140,14 +153,12 @@ class AppViewModel(
             return
         }
         val total = cluster.files.size
-        updateScreen(screen.copy(lookup = Lookup.Identifying(0, total)))
-        identifyJob?.cancel()
-        identifyJob = viewModelScope.launch {
+        startLookup(screen.copy(lookup = Lookup.Identifying(0, total))) {
             val lookup = try {
                 val identified = mutableMapOf<String, Identification>()
                 cluster.files.forEachIndexed { index, file ->
                     library.fingerprint(file)?.let { identified[file.id] = acoustId.lookup(apiKey, it) }
-                    updateScreenIf<Screen.Cluster> { it.copy(lookup = Lookup.Identifying(index + 1, total)) }
+                    updateCluster(cluster.key) { it.copy(lookup = Lookup.Identifying(index + 1, total)) }
                 }
                 if (identified.isEmpty()) {
                     Lookup.Failed("None of the files could be decoded for fingerprinting")
@@ -155,7 +166,7 @@ class AppViewModel(
                     val votes = countReleaseVotes(identified.values.map { it.releaseIds })
                     val topIds = votes.entries.sortedByDescending { it.value }.take(25).map { it.key }
                     val releases = rankByAudioVotes(musicBrainz.releasesByIds(topIds), votes, total)
-                    updateScreenIf<Screen.Cluster> { it.copy(recordingsByFile = identified.mapValues { (_, id) -> id.recordingIds }) }
+                    updateCluster(cluster.key) { it.copy(recordingsByFile = identified.mapValues { (_, id) -> id.recordingIds }) }
                     Lookup.Results(releases, audioVotes = votes, fingerprintedFiles = identified.size)
                 }
             } catch (e: AcoustIdException) {
@@ -164,7 +175,7 @@ class AppViewModel(
                 if (e is CancellationException) throw e
                 Lookup.Failed(e.message ?: e::class.simpleName.orEmpty())
             }
-            updateScreenIf<Screen.Cluster> { it.copy(lookup = lookup) }
+            updateCluster(cluster.key) { it.copy(lookup = lookup) }
         }
     }
 
@@ -172,52 +183,64 @@ class AppViewModel(
         val screen = _state.value.screen as? Screen.Cluster ?: return
         val results = screen.lookup as? Lookup.Results ?: return
         val cluster = clusterFor(screen.key) ?: return
-        updateScreen(screen.copy(lookup = results.copy(loadingReleaseId = release.id)))
-        viewModelScope.launch { openRelease(cluster, release.id, restore = results) }
+        startLookup(screen.copy(lookup = results.copy(loadingReleaseId = release.id))) {
+            openRelease(cluster, release.id, restore = results)
+        }
     }
 
     private suspend fun openRelease(cluster: AlbumCluster, releaseId: String, restore: Lookup) {
         try {
             val full = musicBrainz.release(releaseId)
-            updateScreenIf<Screen.Cluster> {
-                Screen.Match(cluster.key, full, matchFilesToRelease(cluster.files, full, it.recordingsByFile))
+            updateCluster(cluster.key) {
+                Screen.Match(
+                    from = it.copy(lookup = restore),
+                    release = full,
+                    matches = matchFilesToRelease(cluster.files, full, it.recordingsByFile),
+                )
             }
         } catch (e: Exception) {
             if (e is CancellationException) throw e
-            updateScreenIf<Screen.Cluster> { it.copy(lookup = restore) }
+            updateCluster(cluster.key) { it.copy(lookup = restore) }
             _state.update { it.copy(message = "Could not load release: ${e.message}") }
         }
     }
 
     fun setEmbedCover(embed: Boolean) {
-        updateScreenIf<Screen.Match> { it.copy(embedCover = embed) }
+        updateScreenIf<Screen.Match> { if (it.saving) it else it.copy(embedCover = embed) }
     }
 
+    /** Writes tags and cover. Back is ignored until it finishes, so files are never left half-written. */
     fun save() {
         val screen = _state.value.screen as? Screen.Match ?: return
+        if (screen.saving) return
         updateScreen(screen.copy(saving = true))
         viewModelScope.launch {
-            val cover = if (screen.embedCover) downloadCover(screen.release.id) else null
-            val toWrite = screen.matches.filter { it.track != null }
+            val cover = if (screen.embedCover) attempt { coverArt.frontCover(screen.release.id) } else null
             val updated = mutableMapOf<String, AudioFile>()
             var failed = 0
-            for (match in toWrite) {
-                val ok = runCatching {
-                    library.writeTags(match.file, tagsFor(screen.release, match.track!!)) &&
-                        (cover == null || library.writeFrontCover(match.file, cover, "image/jpeg"))
-                }.getOrDefault(false)
-                if (ok) updated[match.file.id] = library.reload(match.file) else failed++
+            var coverFailed = 0
+            for (match in screen.matches) {
+                val track = match.track ?: continue
+                if (attempt { library.writeTags(match.file, tagsFor(screen.release, track)) } != true) {
+                    failed++
+                    continue
+                }
+                if (cover != null && attempt { library.writeFrontCover(match.file, cover, "image/jpeg") } != true) {
+                    coverFailed++
+                }
+                updated[match.file.id] = attempt { library.reload(match.file) } ?: match.file
             }
+
+            val files = _state.value.files.map { updated[it.id] ?: it }
+            val organized = organize(files)
             _state.update { state ->
-                val files = state.files.map { updated[it.id] ?: it }
-                state.copy(
-                    files = files,
-                    clusters = clusterByAlbum(files),
+                state.withLibrary(files, organized).copy(
                     screen = Screen.Library,
                     message = buildString {
                         append("Saved tags for ${updated.size} file(s)")
-                        if (cover != null) append(" with cover art")
+                        if (cover != null && coverFailed < updated.size) append(" with cover art")
                         if (screen.embedCover && cover == null) append(", cover art could not be downloaded")
+                        if (coverFailed > 0) append(", cover failed for $coverFailed")
                         if (failed > 0) append(", $failed failed")
                     },
                 )
@@ -225,18 +248,13 @@ class AppViewModel(
         }
     }
 
-    private suspend fun downloadCover(releaseId: String): ByteArray? = try {
-        coverArt.frontCover(releaseId)
-    } catch (e: Exception) {
-        if (e is CancellationException) throw e
-        null
-    }
-
     fun back() {
-        identifyJob?.cancel()
+        val screen = _state.value.screen
+        if (screen is Screen.Match && screen.saving) return
+        lookupJob?.cancel()
         _state.update { state ->
-            val previous = when (val screen = state.screen) {
-                is Screen.Match -> clusterFor(screen.clusterKey)?.let { Screen.Cluster(it.key) } ?: Screen.Library
+            val previous = when (val current = state.screen) {
+                is Screen.Match -> current.from.takeIf { clusterFor(it.key) != null } ?: Screen.Library
                 else -> Screen.Library
             }
             state.copy(screen = previous)
@@ -253,8 +271,22 @@ class AppViewModel(
 
     fun clusterFor(key: String): AlbumCluster? = _state.value.clusters.firstOrNull { it.key == key }
 
+    private fun startLookup(screen: Screen.Cluster, block: suspend () -> Unit) {
+        lookupJob?.cancel()
+        updateScreen(screen)
+        lookupJob = viewModelScope.launch { block() }
+    }
+
     private fun updateScreen(screen: Screen) {
         _state.update { it.copy(screen = screen) }
+    }
+
+    /** Applies the change only while that album is still the open screen, so late results never land elsewhere. */
+    private fun updateCluster(key: String, change: (Screen.Cluster) -> Screen) {
+        _state.update { state ->
+            val current = state.screen as? Screen.Cluster
+            if (current?.key == key) state.copy(screen = change(current)) else state
+        }
     }
 
     /** Applies the change only if the user is still on a screen of that type. */
@@ -264,4 +296,23 @@ class AppViewModel(
             state.copy(screen = change(current))
         }
     }
+
+    private class Organized(val clusters: List<AlbumCluster>, val issues: Map<String, Map<TagIssue, Int>>)
+
+    private suspend fun organize(files: List<AudioFile>): Organized = withContext(Dispatchers.Default) {
+        val clusters = clusterByAlbum(files)
+        Organized(clusters, clusters.associate { it.key to it.issueCounts() })
+    }
+
+    private fun UiState.withLibrary(files: List<AudioFile>, organized: Organized) =
+        copy(files = files, clusters = organized.clusters, issuesByAlbum = organized.issues)
+}
+
+/** Like runCatching, but lets coroutine cancellation through. */
+private inline fun <T> attempt(block: () -> T): T? = try {
+    block()
+} catch (e: CancellationException) {
+    throw e
+} catch (e: Exception) {
+    null
 }

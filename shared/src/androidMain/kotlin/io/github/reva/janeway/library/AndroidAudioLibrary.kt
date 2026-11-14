@@ -16,11 +16,13 @@ import io.github.reva.janeway.model.AudioFile
 import io.github.reva.janeway.model.FolderRef
 import io.github.reva.janeway.model.Tags
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import java.io.File
+import android.os.ParcelFileDescriptor
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.coroutines.coroutineContext
 
@@ -130,7 +132,10 @@ class AndroidAudioLibrary(private val context: Context) : AudioLibrary {
 
     override suspend fun fingerprint(file: AudioFile): AudioFingerprint? = withContext(Dispatchers.IO) {
         val durationSeconds = file.durationMs?.let { it / 1000 }?.takeIf { it > 0 } ?: return@withContext null
-        AudioFingerprinter.fingerprint(context, Uri.parse(file.id))?.let { AudioFingerprint(it, durationSeconds) }
+        val job = coroutineContext[Job]
+        val fingerprint = AudioFingerprinter.fingerprint(context, Uri.parse(file.id)) { job?.isActive != false }
+        ensureActive()
+        fingerprint?.let { AudioFingerprint(it, durationSeconds) }
     }
 
     override suspend fun writeFrontCover(file: AudioFile, image: ByteArray, mimeType: String): Boolean =
@@ -142,22 +147,31 @@ class AndroidAudioLibrary(private val context: Context) : AudioLibrary {
             saved
         }
 
-    /** Opens the document once; TagLib gets duplicated descriptors because it closes what it is given. */
-    private fun read(uri: Uri, name: String, folder: String): AudioFile? {
-        val descriptor = runCatching { resolver.openFileDescriptor(uri, "r") }.getOrNull() ?: return null
-        return descriptor.use {
-            // Pictures are read only to know whether there is one; the image data is dropped.
-            val metadata = TagLib.getMetadata(it.dup().detachFd(), readPictures = true) ?: return null
-            val properties = TagLib.getAudioProperties(it.dup().detachFd(), AudioPropertiesReadStyle.Fast)
-            AudioFile(
-                id = uri.toString(),
-                fileName = name,
-                folder = folder,
-                durationMs = properties?.length,
-                tags = metadata.propertyMap.mapValues { (_, values) -> values.toList() },
-                hasCover = metadata.pictures.isNotEmpty(),
-            )
+    /**
+     * Opens the document once; TagLib gets duplicated descriptors because it closes what it is given.
+     * Returns null for files that cannot be read, so one broken file does not fail a whole scan.
+     */
+    private fun read(uri: Uri, name: String, folder: String): AudioFile? = try {
+        resolver.openFileDescriptor(uri, "r")?.use { descriptor ->
+            val probedCover = ParcelFileDescriptor.AutoCloseInputStream(descriptor.dup()).use { stream ->
+                CoverProbe.hasCover(ChannelSource(stream.channel), name.substringAfterLast('.', ""))
+            }
+            // Only formats the probe does not understand need TagLib to load the pictures.
+            val metadata = TagLib.getMetadata(descriptor.dup().detachFd(), readPictures = probedCover == null)
+            metadata?.let {
+                val properties = TagLib.getAudioProperties(descriptor.dup().detachFd(), AudioPropertiesReadStyle.Fast)
+                AudioFile(
+                    id = uri.toString(),
+                    fileName = name,
+                    folder = folder,
+                    durationMs = properties?.length,
+                    tags = it.propertyMap.mapValues { (_, values) -> values.toList() },
+                    hasCover = probedCover ?: it.pictures.isNotEmpty(),
+                )
+            }
         }
+    } catch (e: Exception) {
+        null
     }
 
     private data class AudioDocument(
